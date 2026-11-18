@@ -5,6 +5,13 @@ Compose). It answers A queries for exactly one managed domain and applies the
 full address list atomically. A publish carrying a revision that is not
 strictly newer than the one already served is rejected with HTTP 409, so a
 late retry can never roll a node back to an old revision.
+
+Volume snapshot restores are a different matter: the operator may replace the
+volume with an old snapshot, so the served revision can legitimately decrease
+out-of-band. On startup the node immediately heartbeats the revision it
+restored from its own database; management treats this as a rollback claim,
+verifies it against real DNS answers and re-pushes the whole latest list.
+
 """
 from __future__ import annotations
 
@@ -245,6 +252,13 @@ def _report_to_management(revision: int) -> None:
 def _heartbeat_loop() -> None:
     if not MGMT_BASE_URL:
         return
+    # Announce the restored/served revision immediately: after a volume
+    # snapshot restore this is the low (old) revision, and reporting it
+    # without delay lets management withdraw any stale "synced" conclusion.
+    _post_json(
+        f"{MGMT_BASE_URL}/internal/nodes/{NODE_ID}/heartbeat",
+        {"served_revision": snapshot()["revision"]},
+    )
     while True:
         time.sleep(HEARTBEAT_INTERVAL)
         _post_json(

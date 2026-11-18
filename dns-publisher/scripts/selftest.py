@@ -5,7 +5,11 @@
   1. 发布与双节点同步、整列表原子生效、实答一致
   2. 单节点失联：另一节点继续应答；状态显示待补，绝不误报 synced
   3. 节点恢复后自动补齐到最新修订
-  4. 迟到的旧修订推送被节点拒绝(409)，节点/同步结论不回退
+  4. 迟到的旧修订推送被节点拒绝(409)，节点/同步结论不回退；
+     迟到的旧/高版本上报都只能进 claim，不能改管理端观察值
+  4b. 交错/乱序下发: 跳号接受、随后旧号拒绝
+  4c. 旧卷快照恢复: 实际服务版本倒退时撤销同步结论、补发最新整份地址，
+     只有两端实答与现行修订一致才重新报 synced；恢复期间发布不被旧上报误判
   5. 并发发布：修订严格递增、无重号
   6. 节点重启：独立 SQLite 持久化，服务版本不丢
   7. 非法输入校验
@@ -16,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -90,6 +95,10 @@ def wait_status(cond, timeout: float = 20.0, interval: float = 0.5):
     return last
 
 
+def view_of(st: dict, node_id: str) -> dict:
+    return next(n for n in st["nodes"] if n["node_id"] == node_id)
+
+
 def start_node(spec: dict) -> subprocess.Popen:
     assert tmpdir is not None
     data_dir = tmpdir / spec["id"]
@@ -108,6 +117,13 @@ def start_node(spec: dict) -> subprocess.Popen:
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     procs[spec["id"]] = p
+    # Fail fast on a bind conflict rather than silently talking to a stale
+    # process that still holds the port.
+    time.sleep(0.6)
+    if p.poll() is not None:
+        raise RuntimeError(
+            f"{spec['id']} exited at startup:\n{p.stdout.read() if p.stdout else ''}"
+        )
     return p
 
 
@@ -151,14 +167,41 @@ def wait_http(url_port: int, path: str, timeout: float = 15.0) -> bool:
     return False
 
 
+def _port_in_use(port: int, udp: bool = True) -> bool:
+    fam = socket.AF_INET
+    typ = socket.SOCK_DGRAM if udp else socket.SOCK_STREAM
+    s = socket.socket(fam, typ)
+    try:
+        s.bind(("127.0.0.1", port))
+    except OSError:
+        return True
+    else:
+        return False
+    finally:
+        s.close()
+
+
 def stop(name: str) -> None:
     p = procs.pop(name, None)
-    if p and p.poll() is None:
-        p.terminate()
-        try:
-            p.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            p.kill()
+    if not p or p.poll() is not None:
+        return
+    p.terminate()
+    try:
+        p.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait(timeout=5)
+    # The process must fully release its UDP/HTTP ports before a snapshot or
+    # volume restore, otherwise a restarted node loses the bind while the old
+    # process keeps answering from the deleted file (a harness-only race).
+    spec = next((s for s in NODE_SPECS if s["id"] == name), None)
+    if spec:
+        deadline = time.time() + 8
+        while time.time() < deadline and (
+            _port_in_use(spec["udp"], udp=True)
+            or _port_in_use(spec["http"], udp=False)
+        ):
+            time.sleep(0.1)
 
 
 def teardown() -> None:
@@ -277,12 +320,31 @@ def scenario_stale() -> None:
     _, st = http("GET", "/status")
     check("管理端同步结论仍为 synced", st["overall_status"] == "synced", json.dumps(st))
 
-    # 模拟迟到的旧上报
+    # 模拟迟到的旧上报（节点自身的 claim，可记录但不能回滚管理端观察值）
     code, _ = http("POST", "/internal/nodes/node-a/report", {"served_revision": 1})
     _, st = http("GET", "/status")
-    na = next(n for n in st["nodes"] if n["node_id"] == "node-a")
-    check("迟到旧上报被 MAX 钳制, served 不回退",
+    na = view_of(st, "node-a")
+    check("迟到旧上报不回退管理端观察的 served 版本",
           code == 200 and na["served_revision"] == 3, json.dumps(na))
+    check("旧上报仅体现在 reported_revision",
+          na["reported_revision"] == 1, json.dumps(na))
+    # claim 与观察值矛盾时先撤销同步结论，待下一轮实答核对后恢复
+    check("矛盾 claim 立即撤销同步结论(宁可保守)", st["synced"] is False, json.dumps(na))
+    st = wait_status(lambda s: s["overall_status"] == "synced", timeout=10)
+    check("实答核对通过后同步结论自动恢复",
+          st["overall_status"] == "synced" and view_of(st, "node-a")["rollback_suspected"] is False,
+          json.dumps(st))
+
+    # 反向风险：旧进程迟到的“较高版本”上报也不能凭一句话抬高观察值
+    code, _ = http("POST", "/internal/nodes/node-a/report", {"served_revision": 999})
+    _, st = http("GET", "/status")
+    na = view_of(st, "node-a")
+    check("迟到高版本上报不能凭 claim 抬高 served/verified",
+          code == 200 and na["served_revision"] == 3
+          and na["verified_revision"] == 3 and na["reported_revision"] == 999,
+          json.dumps(na))
+    st = wait_status(lambda s: s["overall_status"] == "synced", timeout=10)
+    check("高 claim 经实答核对后不影响 synced", st["synced"] is True, json.dumps(st))
 
 
 def scenario_interleave() -> None:
@@ -338,6 +400,116 @@ def scenario_interleave() -> None:
     check("收敛后两端实答一致",
           dns_answers(NODE_SPECS[0]["udp"]) == dns_answers(NODE_SPECS[1]["udp"])
           == {"198.51.100.4"})
+
+
+def scenario_snapshot_rollback() -> None:
+    print("\n=== 4c. 旧卷快照恢复: 识别版本倒退、撤销同步、补发整列表 ===")
+    spec = NODE_SPECS[1]                       # 对 node-b 做快照恢复
+    node_dir = tmpdir / spec["id"]
+    snapshot_dir = tmpdir / f"{spec['id']}-snapshot"
+    _, st0 = http("GET", "/status")
+    base = st0["latest_revision"]["revision"]
+
+    # 1) 在节点停服（卷静止）时打一个旧快照（当前版本 base）
+    stop(spec["id"])
+    time.sleep(0.5)
+    if snapshot_dir.exists():
+        shutil.rmtree(snapshot_dir)
+    shutil.copytree(node_dir, snapshot_dir)
+    start_node(spec)
+    check("打快照后节点B 重新就绪", wait_http(spec["http"], "/health"))
+    wait_status(lambda s: s["overall_status"] == "synced", timeout=15)
+
+    # 2) 随后制造两个更新的修订
+    code, body = http("POST", "/publishes", {"addresses": ["203.0.113.1"]})
+    rev_new1 = body["revision"]
+    check("快照后第1次新发布成功", code == 201 and rev_new1 == base + 1, str(body))
+    code, body = http("POST", "/publishes", {"addresses": ["203.0.113.2"]})
+    rev_new2 = body["revision"]
+    check("快照后第2次新发布成功(恢复期间仍可发布)", code == 201 and rev_new2 == base + 2,
+          str(body))
+    st = wait_status(lambda s: s["overall_status"] == "synced", timeout=25)
+    check("发布后双节点正常同步",
+          all(n["served_revision"] == rev_new2 for n in st["nodes"]),
+          json.dumps(st["nodes"]))
+
+    # 3) 停节点并用旧快照覆盖其持久化卷 -> 实际服务版本倒退到 base
+    stop(spec["id"])
+    time.sleep(0.5)
+    shutil.rmtree(node_dir)
+    shutil.copytree(snapshot_dir, node_dir)
+
+    # 4) 旧进程迟到的“高版本”上报不能掩盖恢复节点的旧数据
+    code, _ = http("POST", f"/internal/nodes/{spec['id']}/report",
+                   {"served_revision": rev_new2})
+    check("失联节点的旧上报仍被接收(刷新 claim)", code == 200)
+    _, st = http("GET", "/status")
+    nb = view_of(st, spec["id"])
+    check("失联期间高 claim 不产生任何实答证据(verified 被清零, 不抬升)",
+          nb["reported_revision"] == rev_new2 and nb["verified_revision"] == 0
+          and nb["caught_up"] is False,
+          json.dumps(nb))
+    start_node(spec)
+    check("恢复节点B 控制面起来", wait_http(spec["http"], "/health"))
+
+    # 节点自身当前进程的 /health 是确定性的回滚实据（高 claim 被戳穿）
+    import urllib.request as _ur
+    with _ur.urlopen(f"http://127.0.0.1:{spec['http']}/health", timeout=3) as _r:
+        health = json.loads(_r.read())
+    check("节点当前进程如实报告倒退的旧版本(实据)",
+          int(health["revision"]) < rev_new2, json.dumps(health))
+    check("节点B 实答确为旧快照数据(版本倒退属实)",
+          dns_answers(spec["udp"]) != {"203.0.113.2"},
+          str(dns_answers(spec["udp"])))
+    check("另一节点A 继续供答最新修订",
+          dns_answers(NODE_SPECS[0]["udp"]) == {"203.0.113.2"})
+
+    # 管理端必须经实据撤销同步结论（回滚窗口内可见，随后自动补齐）
+    deadline = time.time() + 12
+    saw_withdrawn, saw_rollback_flag = False, False
+    while time.time() < deadline:
+        _, st = http("GET", "/status")
+        nb = view_of(st, spec["id"])
+        if not st["synced"] and spec["id"] in st["pending_nodes"]:
+            saw_withdrawn = True
+        if nb["rollback_suspected"]:
+            saw_rollback_flag = True
+        if st["overall_status"] == "synced":
+            break
+        time.sleep(0.2)
+    check("管理端撤销同步结论并将 node-b 列入待补", saw_withdrawn)
+    check("回滚期间置 rollback_suspected 标记", saw_rollback_flag)
+    code, ver = http("GET", "/verify")
+    check("/verify 始终以两端实答为依据(接口可用)", code == 200, json.dumps(ver))
+
+    # 5) 后台对账必须识别倒退并补发“最新整份地址”，直到实答一致才重新同步
+    st = wait_status(lambda s: s["overall_status"] == "synced", timeout=30)
+    nb = view_of(st, spec["id"])
+    check("恢复节点自动补齐到最新修订",
+          st["overall_status"] == "synced"
+          and nb["served_revision"] == rev_new2
+          and nb["verified_revision"] == rev_new2
+          and nb["rollback_suspected"] is False,
+          json.dumps(nb))
+    check("补齐后两端实答一致且为最新整列表",
+          dns_answers(NODE_SPECS[0]["udp"])
+          == dns_answers(NODE_SPECS[1]["udp"]) == {"203.0.113.2"})
+
+    # 6) 恢复期间的新发布同样不能被旧上报误判生效：再来一次发布验证
+    code, body = http("POST", "/publishes", {"addresses": ["203.0.113.3"]})
+    rev_new3 = body["revision"]
+    check("恢复后新发布修订继续递增", code == 201 and rev_new3 == rev_new2 + 1, str(body))
+    # 注入一个针对新修订的“旧版本”claim，管理端必须以实答为准
+    http("POST", f"/internal/nodes/{spec['id']}/report",
+         {"served_revision": rev_new2})
+    st = wait_status(lambda s: s["overall_status"] == "synced", timeout=25)
+    nb = view_of(st, spec["id"])
+    check("新发布以实答收敛, 旧 claim 不影响同步判定",
+          st["overall_status"] == "synced" and nb["verified_revision"] == rev_new3,
+          json.dumps(nb))
+    check("新发布两端实答一致",
+          dns_answers(NODE_SPECS[0]["udp"])
+          == dns_answers(NODE_SPECS[1]["udp"]) == {"203.0.113.3"})
 
 
 def scenario_concurrent() -> None:
@@ -418,6 +590,7 @@ def main() -> int:
         scenario_recovery()
         scenario_stale()
         scenario_interleave()
+        scenario_snapshot_rollback()
         scenario_concurrent()
         scenario_persistence()
         scenario_validation()

@@ -6,9 +6,15 @@ Responsibilities
   each one into a new strictly increasing revision in SQLite.
 * Push every revision to both independent DNS nodes and keep reconciling
   until each node serves the newest revision.
-* Report per-node served revision, online/offline state and catch-up status,
-  and an aggregate conclusion that can *never* read "synced" while a node is
-  offline or behind.
+* Detect a node that has been restored from an old volume snapshot: its real
+  served revision can move *backwards*.  Management observes the node itself
+  (live ``/health`` reads and real UDP DNS probes) instead of trusting
+  fire-and-forget reports, withdraws any earlier "synced" conclusion on
+  rollback and re-pushes the whole latest address list.
+* Report per-node claimed / observed / verified revision, online/offline
+  state and catch-up status.  The aggregate conclusion can only read
+  "synced" while *both* nodes' real DNS answers freshly match the current
+  revision.
 * Verify the latest revision against the real UDP DNS answers of both nodes.
 """
 from __future__ import annotations
@@ -51,6 +57,9 @@ NODES: list[dict[str, Any]] = _load_nodes()
 NODE_IDS = [n["id"] for n in NODES]
 RECONCILE_INTERVAL = float(os.environ.get("RECONCILE_INTERVAL", "3"))
 PUSH_TIMEOUT = float(os.environ.get("PUSH_TIMEOUT", "4"))
+# A DNS-based verification is treated as evidence only for this many seconds.
+# After it goes stale the node must be re-probed before "synced" is reported.
+VERIFY_FRESHNESS = float(os.environ.get("VERIFY_FRESHNESS_SECONDS", "15"))
 
 
 # --------------------------------------------------------------------------- #
@@ -84,7 +93,7 @@ class ReportRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Node interaction (blocking urllib, executed in worker threads)
+# Blocking node interaction (executed in worker threads)
 # --------------------------------------------------------------------------- #
 def _http_post(url: str, payload: dict, timeout: float = PUSH_TIMEOUT) -> tuple[int, dict]:
     req = urlrequest.Request(
@@ -114,7 +123,12 @@ def _http_get(url: str, timeout: float = PUSH_TIMEOUT) -> dict:
 
 
 def push_to_node(node: dict, revision: int, domain: str, addresses: list[str]) -> dict:
-    """Push one revision to one node. A 409 means it already has newer data."""
+    """Push one (whole-list) revision to one node.
+
+    A 409 means the node's *current* process already serves a newer
+    revision; its real served revision is then fetched directly instead of
+    being inferred from any report.
+    """
     try:
         code, body = _http_post(
             f"{node['control_url'].rstrip('/')}/publish",
@@ -127,8 +141,6 @@ def push_to_node(node: dict, revision: int, domain: str, addresses: list[str]) -
         return {"ok": True, "status": "applied",
                 "served_revision": body.get("served_revision", revision)}
     if code == 409:
-        # Stale push rejected — fetch the node's real served revision so the
-        # management view reflects the node without ever going backwards.
         try:
             health = _http_get(f"{node['control_url'].rstrip('/')}/health")
             return {"ok": True, "status": "already-newer",
@@ -138,59 +150,6 @@ def push_to_node(node: dict, revision: int, domain: str, addresses: list[str]) -
     return {"ok": False, "status": f"http-{code}", "detail": body}
 
 
-def _record_served(node_id: str, served: int) -> None:
-    with db.get_conn() as conn:
-        db.report_served(conn, node_id, served)
-
-
-async def reconcile_once() -> dict[str, Any]:
-    """Push the latest revision to every node that is behind it."""
-    with db.get_conn() as conn:
-        latest = db.latest_revision(conn)
-        if latest is None:
-            return {"skipped": "no revision yet"}
-        rev = db.row_to_revision_dict(latest)
-        states = {r["node_id"]: r for r in db.all_node_state(conn)}
-
-    results: dict[str, Any] = {}
-    loop = asyncio.get_running_loop()
-    tasks = []
-    target_nodes = []
-    for node in NODES:
-        st = states.get(node["id"])
-        served = st["served_revision"] if st else 0
-        if served >= rev["revision"]:
-            results[node["id"]] = {"ok": True, "status": "up-to-date",
-                                   "served_revision": served}
-            continue
-        target_nodes.append(node)
-        tasks.append(
-            loop.run_in_executor(
-                None, push_to_node, node,
-                rev["revision"], rev["domain"], rev["addresses"],
-            )
-        )
-    for node, outcome in zip(target_nodes, await asyncio.gather(*tasks, return_exceptions=True)):
-        if isinstance(outcome, Exception):
-            outcome = {"ok": False, "status": "error", "detail": str(outcome)}
-        results[node["id"]] = outcome
-        if outcome.get("ok") and outcome.get("served_revision") is not None:
-            _record_served(node["id"], int(outcome["served_revision"]))
-    return {"revision": rev["revision"], "results": results}
-
-
-async def reconciler_loop() -> None:
-    while True:
-        try:
-            await reconcile_once()
-        except Exception as exc:  # never let the loop die
-            print(f"[mgmt] reconcile error: {exc!r}")
-        await asyncio.sleep(RECONCILE_INTERVAL)
-
-
-# --------------------------------------------------------------------------- #
-# Real DNS answer verification
-# --------------------------------------------------------------------------- #
 def _dns_query(host: str, port: int, domain: str, timeout: float = 3.0) -> dict:
     import socket
 
@@ -215,6 +174,138 @@ def _dns_query(host: str, port: int, domain: str, timeout: float = 3.0) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Evidence-based per-node observation / reconciliation
+# --------------------------------------------------------------------------- #
+def _observe_and_reconcile_node(node: dict, rev: dict) -> dict[str, Any]:
+    """Blocking worker: gather live evidence for one node and catch it up.
+
+    Order of operations, all in this worker thread:
+      1. read the node's current /health (its own current process/database);
+      2. send a real UDP DNS query and compare against the target revision;
+      3. push the whole latest list whenever the real answer does not match;
+      4. probe DNS again after a push;
+      5. persist every finding through db helpers.
+    """
+    node_id = node["id"]
+    target = rev["revision"]
+    expected = sorted(rev["addresses"])
+    result: dict[str, Any] = {
+        "node_id": node_id, "target_revision": target,
+        "health_revision": None, "push": None, "rollback": False,
+    }
+
+    # 1) Live control-plane evidence from the node itself.
+    health_rev: int | None = None
+    try:
+        health = _http_get(f"{node['control_url'].rstrip('/')}/health")
+        health_rev = int(health.get("revision", 0))
+        result["health_revision"] = health_rev
+        with db.get_conn() as conn:
+            if db.set_observed(conn, node_id, health_rev):
+                result["rollback"] = True
+    except ConnectionError as exc:
+        result["health_error"] = str(exc)
+
+    # 2) Real DNS evidence against the current revision.
+    def probe() -> tuple[dict | None, str | None]:
+        try:
+            answer = _dns_query(node["dns_host"], node["dns_port"], rev["domain"])
+            if not answer["aa"]:
+                return answer, f"non-authoritative answer (AA=0, rcode={answer['rcode']})"
+            if answer["answers"] != expected:
+                return answer, (
+                    f"dns answers {answer['answers']} do not match revision "
+                    f"{target} {expected}"
+                )
+            return answer, None
+        except Exception as exc:  # unreachable / timeout / parse failure
+            return None, f"dns probe failed: {exc}"
+
+    answer, mismatch = probe()
+
+    # 3) Any mismatch (stale answers, wrong data, unreachable DNS while the
+    #    control plane is reachable) requires a full-list push.
+    if mismatch is not None and health_rev is not None:
+        outcome = push_to_node(node, target, rev["domain"], rev["addresses"])
+        result["push"] = outcome
+        if outcome.get("ok") and outcome.get("served_revision") is not None:
+            pushed_rev = int(outcome["served_revision"])
+            with db.get_conn() as conn:
+                if db.set_observed(conn, node_id, pushed_rev):
+                    result["rollback"] = True
+            # 4) Re-probe the real answers; never trust the push response alone.
+            answer, mismatch = probe()
+
+    # 5) Persist verification evidence.
+    with db.get_conn() as conn:
+        if mismatch is None and answer is not None:
+            db.set_verified(conn, node_id, target, answer["answers"])
+            result["verified"] = True
+            result["answers"] = answer["answers"]
+        else:
+            db.set_verify_failed(conn, node_id, mismatch or "no answer")
+            result["verified"] = False
+            result["detail"] = mismatch
+    return result
+
+
+_reconcile_lock = asyncio.Lock()
+_reconcile_wakeup = asyncio.Event()
+
+
+async def reconcile_once() -> dict[str, Any]:
+    """Observe every node against the latest revision and push when behind.
+
+    Whether a node needs a push is decided from *live* evidence (health +
+    real DNS answers), never from a stored counter.  A snapshot-restored
+    node therefore cannot be skipped as "already synced".
+    """
+    async with _reconcile_lock:
+        with db.get_conn() as conn:
+            latest = db.latest_revision(conn)
+            if latest is None:
+                return {"skipped": "no revision yet"}
+            rev = db.row_to_revision_dict(latest)
+
+        loop = asyncio.get_running_loop()
+        outcomes = await asyncio.gather(
+            *(loop.run_in_executor(None, _observe_and_reconcile_node, node, rev)
+              for node in NODES),
+            return_exceptions=True,
+        )
+        results: dict[str, Any] = {}
+        for node, outcome in zip(NODES, outcomes):
+            if isinstance(outcome, Exception):
+                outcome = {"node_id": node["id"], "verified": False,
+                           "detail": f"observe error: {outcome!r}"}
+                with db.get_conn() as conn:
+                    db.set_verify_failed(conn, node["id"], str(outcome))
+            results[node["id"]] = outcome
+        return {"revision": rev["revision"], "results": results}
+
+
+async def reconciler_loop() -> None:
+    while True:
+        try:
+            await reconcile_once()
+        except Exception as exc:  # never let the loop die
+            print(f"[mgmt] reconcile error: {exc!r}")
+        try:
+            await asyncio.wait_for(_reconcile_wakeup.wait(), timeout=RECONCILE_INTERVAL)
+            _reconcile_wakeup.clear()
+        except asyncio.TimeoutError:
+            pass
+
+
+def _request_reconcile() -> None:
+    """Wake the background reconciler immediately (best effort)."""
+    try:
+        _reconcile_wakeup.set()
+    except RuntimeError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # Application
 # --------------------------------------------------------------------------- #
 @asynccontextmanager
@@ -229,8 +320,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="单域名 A 记录发布 API",
-    description="机房设备管理域名 A 记录发布：递增修订、双权威节点同步、实答核对。",
-    version="1.0.0",
+    description="机房设备管理域名 A 记录发布：递增修订、双权威节点同步、实答核对、"
+                "快照回滚识别与自动补齐。",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -246,11 +338,49 @@ async def create_publish(req: PublishRequest, background: BackgroundTasks) -> di
 
     # Immediate push attempt; the background reconciler guarantees retries.
     background.add_task(reconcile_once)
+    _request_reconcile()
     return {
         "revision": revision,
         "domain": rev["domain"],
         "addresses": rev["addresses"],
         "message": "修订已创建，正在向各节点下发；可通过 /status 查看同步进度。",
+    }
+
+
+def _node_view(node: dict, st, target: int, now: float) -> dict:
+    served = st["served_revision"] if st else 0
+    reported = st["reported_revision"] if st else 0
+    verified_rev = st["verified_revision"] if st else 0
+    verified_at = st["verified_at"] if st else 0
+    last_seen = st["last_seen"] if st else 0
+    rollback = bool(st["rollback_suspected"]) if st else False
+    online = (now - last_seen) <= db.OFFLINE_AFTER if last_seen > 0 else False
+    fresh = (now - verified_at) <= VERIFY_FRESHNESS if verified_at > 0 else False
+    # Caught-up requires *fresh real DNS evidence* for the current revision.
+    caught_up = (
+        target > 0 and verified_rev == target and fresh and not rollback
+    )
+    if caught_up:
+        catch_up_status = "served"
+    elif not online:
+        catch_up_status = "waiting-node-recovery"
+    elif rollback:
+        catch_up_status = "rollback-repushing"
+    else:
+        catch_up_status = "pending-retry"
+    return {
+        "node_id": node["id"],
+        "online": online,
+        "served_revision": served,
+        "reported_revision": reported,
+        "verified_revision": verified_rev,
+        "verification_fresh": fresh,
+        "rollback_suspected": rollback,
+        "target_revision": target,
+        "last_seen_seconds_ago": round(now - last_seen, 1) if last_seen else None,
+        "last_verify_error": st["last_verify_error"] if st else "",
+        "caught_up": caught_up,
+        "catch_up_status": catch_up_status,
     }
 
 
@@ -268,27 +398,12 @@ async def status() -> dict:
     node_views: list[dict] = []
     offline_ids, pending_ids = [], []
     for node in NODES:
-        st = states.get(node["id"])
-        served = st["served_revision"] if st else 0
-        last_seen = st["last_seen"] if st else 0
-        online = (now - last_seen) <= db.OFFLINE_AFTER if last_seen > 0 else False
-        caught_up = latest_rev is not None and served >= target
-        if not online:
+        view = _node_view(node, states.get(node["id"]), target, now)
+        if not view["online"]:
             offline_ids.append(node["id"])
-        if not caught_up:
+        if not view["caught_up"]:
             pending_ids.append(node["id"])
-        node_views.append({
-            "node_id": node["id"],
-            "online": online,
-            "served_revision": served,
-            "target_revision": target,
-            "last_seen_seconds_ago": round(now - last_seen, 1) if last_seen else None,
-            "caught_up": caught_up,
-            "catch_up_status": (
-                "served" if caught_up else
-                ("pending-retry" if online else "waiting-node-recovery")
-            ),
-        })
+        node_views.append(view)
 
     if latest_rev is None:
         overall = "no-revision-yet"
@@ -335,9 +450,20 @@ async def verify() -> dict:
                 None, _dns_query, node["dns_host"], node["dns_port"], rev["domain"]
             )
             match = answer["answers"] == sorted(rev["addresses"]) and answer["aa"]
+            # Persist the fresh evidence so /status reflects this probe too.
+            with db.get_conn() as conn:
+                if match:
+                    db.set_verified(conn, node["id"], rev["revision"], answer["answers"])
+                else:
+                    db.set_verify_failed(
+                        conn, node["id"],
+                        f"answers {answer['answers']} != {sorted(rev['addresses'])}",
+                    )
         except Exception as exc:
             answer = {"error": str(exc)}
             match = False
+            with db.get_conn() as conn:
+                db.set_verify_failed(conn, node["id"], str(exc))
         all_match &= match
         findings.append({"node_id": node["id"], **answer,
                          "matches_latest_revision": match})
@@ -363,14 +489,20 @@ async def heartbeat(node_id: str, req: ReportRequest) -> dict:
     if node_id not in NODE_IDS:
         raise HTTPException(404, "unknown node")
     with db.get_conn() as conn:
-        db.upsert_node_heartbeat(conn, node_id)
-        db.report_served(conn, node_id, req.served_revision)
-    return {"ok": True}
+        # record_claim also refreshes last_seen, marking the node online.
+        rollback = db.record_claim(conn, node_id, req.served_revision)
+    if rollback:
+        # A restored node is claiming an older revision: withdraw any earlier
+        # sync conclusion immediately and re-push the whole latest list.
+        _request_reconcile()
+    return {"ok": True, "rollback_suspected": rollback}
 
 
 @app.post("/internal/nodes/{node_id}/report")
 async def report(node_id: str, req: ReportRequest) -> dict:
     if node_id not in NODE_IDS:
         raise HTTPException(404, "unknown node")
-    _record_served(node_id, req.served_revision)
-    return {"ok": True}
+    with db.get_conn() as conn:
+        rollback = db.record_claim(conn, node_id, req.served_revision)
+    _request_reconcile()
+    return {"ok": True, "rollback_suspected": rollback}
